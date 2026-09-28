@@ -1,0 +1,113 @@
+nume: RDP 
+
+pe: 
+  workflow_dispatch: 
+
+jobs: 
+  secure-rdp: 
+    runs-on: windows-latest 
+    timeout-minutes: 3600 
+
+    pași: 
+      - nume: Configurați setările RDP principale 
+        executați: | 
+          # Activați Desktop la distanță și dezactivați autentificarea la nivel de rețea (dacă este necesar) 
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' ` 
+                             -Name "fDenyTSConnections" -Value 0 -Force 
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' ` 
+                             -Name "UserAuthentication" -Value 0 -Force 
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' ` 
+                             -Name "SecurityLayer" -Value 0 -Force 
+
+          # Eliminați orice regulă existentă cu același nume pentru a evita duplicarea 
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 
+          
+          # Pentru testare, permiteți orice conexiune primită pe portul 3389 
+          netsh advfirewall firewall add rule name="RDP-Tailscale" ` 
+            dir=in action=allow protocol=TCP localport=3389 
+
+          # (Opțional) Reporniți serviciul Remote Desktop pentru a vă asigura că modificările au efect 
+          Restart-Service -Name TermService -Force 
+
+      - name: Creați utilizator RDP cu parolă securizată 
+        run: | 
+          Add-Type -AssemblyName System.Security 
+          $charSet = @{ 
+              Upper = [char[]](65..90) # AZ 
+              Lower = [char[]](97..122) # az 
+              Number = [char[]](48..57) # 0-9 
+              Special = ([char[]](33..47) + [char[]](58..64) + 
+                         [char[]](91..96) + [char[]](123..126)) # Caractere speciale 
+          } 
+          $rawPassword = @() 
+          $rawPassword += $charSet.Upper | Get-Random -Count 4 
+          $rawPassword += $charSet.Lower | Get-Random -Count 4 
+          $rawPassword += $charSet.Number | Get-Random -Count 4 
+          $rawPassword += $charSet.Special | Get-Random -Count 4 
+          $password = -join ($rawPassword | Sort-Object { Get-Random }) 
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force 
+          New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires 
+          Add-LocalGroupMember -Group "Administratori" -Member "RDP" 
+          Add-LocalGroupMember -Group "Utilizatori Desktop la distanță" -Member "RDP"
+          
+          echo "RDP_CREDS=Utilizator: RDP | Parolă: $password" >> $env:GITHUB_ENV 
+          
+          if (-not (Get-LocalUser -Name "RDP")) { 
+              Write-Error "Crearea utilizatorului a eșuat" 
+              exit 1 
+          } 
+
+      - name: Instalare Tailscale 
+        executare: | 
+          $tsUrl = " https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi " 
+          $installerPath = "$env:TEMP ailscale.msi" 
+          
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath 
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait 
+          Remove-Item $installerPath -Force 
+
+      - name: Stabilire conexiune Tailscale 
+        executare: | 
+          # Deschideți Tailscale cu cheia de autentificare furnizată și setați un nume de gazdă unic 
+          & "$env:ProgramFiles\Tailscale ailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID 
+          
+          # Așteptați ca Tailscale să atribuie o adresă IP 
+          $tsIP = $null 
+          $retries = 0 
+          while (-not $tsIP -and $retries -lt 10) { 
+              $tsIP = & "$env:ProgramFiles\Tailscale ailscale.exe" ip -4 
+              Start-Sleep -Seconds 5 
+              $retries++ 
+          } 
+          
+          if (-not $tsIP) { 
+              Write-Error "Adresa IP Tailscale nealocată. Se închide." 
+              exit 1 
+          } 
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV 
+      
+      - name: Verificați accesibilitatea RDP 
+        run: | 
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP" 
+          
+          # Testează conectivitatea folosind Test-NetConnection pe adresa IP Tailscale pe portul 3389 
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 
+          if (-not $testResult.TcpTestSucceeded) { 
+              Write-Error "Conexiune TCP la portul RDP 3389 eșuată" 
+              exit 1 
+          } 
+          Write-Host "Conectivitate TCP reușită!" 
+
+      - name: Menține conexiunea 
+        run: | 
+          Write-Host "`n=== RDP ACCESS ===" 
+          Write-Host "Adresă: $env:TAILSCALE_IP" 
+          Write-Host "Nume utilizator: RDP" 
+          Write-Host "Parolă: $(echo $env:RDP_CREDS)" 
+          Write-Host "==================`n" 
+          
+          # Menține runner-ul activ pe termen nelimitat (sau până la anularea manuală) 
+          while ($true) { 
+              Write-Host "[$(Get-Date)] RDP activ - Folosiți Ctrl+C în fluxul de lucru pentru a termina" 
+              Start-Sleep -Secunde 300
+          }
